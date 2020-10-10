@@ -122,6 +122,12 @@ static void ProcessList_buildTree(ProcessList* this, pid_t pid, int level, int i
          Vector_add(children, process);
       }
    }
+
+   // sort children in by default comparator
+   // so all children will be sorted by it.
+   // only a nodes with deep == 0 will be sorted by PID
+   Vector_quickSort(children);
+
    int size = Vector_size(children);
    for (int i = 0; i < size; i++) {
       Process* process = (Process*) (Vector_get(children, i));
