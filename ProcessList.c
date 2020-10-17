@@ -10,6 +10,7 @@ in the source distribution for its full text.
 
 #include "CRT.h"
 #include "StringUtils.h"
+#include "Vector.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,8 @@ ProcessList* ProcessList_init(ProcessList* this, const ObjectClass* klass, Users
 
    // tree-view auxiliary buffer
    this->processes2 = Vector_new(klass, true, DEFAULT_SIZE);
+
+   this->treeSet = Hashtable_new(1400, false);
 
    // set later by platform-specific code
    this->cpuCount = 0;
@@ -60,6 +63,7 @@ void ProcessList_done(ProcessList* this) {
    Hashtable_delete(this->processTable);
    Vector_delete(this->processes);
    Vector_delete(this->processes2);
+   Vector_delete(this->treeSetVec);
 }
 
 void ProcessList_setPanel(ProcessList* this, Panel* panel) {
@@ -112,7 +116,59 @@ int ProcessList_size(ProcessList* this) {
    return (Vector_size(this->processes));
 }
 
-static void ProcessList_buildTree(ProcessList* this, pid_t pid, int level, int indent, int direction, bool show) {
+static int ProcessList_sortTreeSetLayer(ProcessList* this, pid_t pid, int deep) {
+   Vector* layer = Vector_new(Class(Process), false, DEFAULT_SIZE);
+
+   for (int i = 0; i < Vector_size(this->processes); i++) {
+      Process* process = (Process*) (Vector_get(this->processes, i));
+      // Process_isChildOf can be replaced by isInRange
+      if (process->tree_deep == deep && Process_isChildOf(process, pid)) {
+         process = (Process*) (Vector_take(this->processes, i));
+         Vector_add(layer, process);
+      }
+   }
+
+   Vector_quickSort(layer);
+
+   int size = Vector_size(layer);
+   // printf("deep=%d, size=%d\n", deep, size);
+
+   for (int i = 0; i < Vector_size(layer); i++) {
+      Process* process = (Process*) (Vector_get(layer, i));
+
+      // todo: indent resolve
+
+      Vector_add(this->processes2, process);
+
+      size += ProcessList_sortTreeSetLayer(this, process->pid, deep+1);
+   }
+   
+   Vector_delete(layer);
+
+   return size;
+}
+
+static void ProcessList_sortTreeSet(ProcessList* this) {
+   int vsize = Vector_size(this->processes);
+   assert(0 == Vector_size(this->processes2));
+   int size = ProcessList_sortTreeSetLayer(this, 0, 0);
+   assert(size == Vector_size(this->processes2));
+   assert(size == vsize);
+   assert(0 == Vector_size(this->processes));
+
+   Vector* t = this->processes;
+   this->processes = this->processes2;
+   this->processes2 = t;
+}
+
+static void HashTableView(int key, void* data, void* _) {
+   printf("%d - %d\n", key, ((Process*)data)->pid);
+}
+
+static void ProcessList_buildTreeBranch(ProcessList* this, pid_t pid, int level, int indent, int direction, bool show, int* node_counter, int* node_index) {
+   (*node_counter)++;
+   int lft = *node_counter;
+
    Vector* children = Vector_new(Class(Process), false, DEFAULT_SIZE);
 
    for (int i = Vector_size(this->processes) - 1; i >= 0; i--) {
@@ -122,11 +178,6 @@ static void ProcessList_buildTree(ProcessList* this, pid_t pid, int level, int i
          Vector_add(children, process);
       }
    }
-
-   // sort children in by default comparator
-   // so all children will be sorted by it.
-   // only a nodes with deep == 0 will be sorted by PID
-   Vector_quickSort(children);
 
    int size = Vector_size(children);
    for (int i = 0; i < size; i++) {
@@ -138,83 +189,100 @@ static void ProcessList_buildTree(ProcessList* this, pid_t pid, int level, int i
          Vector_add(this->processes2, process);
       else
          Vector_insert(this->processes2, 0, process);
-      assert(this->processes2->items == s+1); (void)s;
+      assert(this->processes2->items == s+1);
       int nextIndent = indent | (1 << level);
-      ProcessList_buildTree(this, process->pid, level+1, (i < size - 1) ? nextIndent : indent, direction, show ? process->showChildren : false);
+      ProcessList_buildTreeBranch(this, process->pid, level+1, (i < size - 1) ? nextIndent : indent, direction, show ? process->showChildren : false, node_counter, node_index);      
       if (i == size - 1)
          process->indent = -nextIndent;
       else
          process->indent = nextIndent;
+
+      (*node_index)++;
    }
    Vector_delete(children);
+
+   (*node_counter)++;
+   int rht = *node_counter;
+
+   Process* proc = (Process*)Hashtable_get(this->processTable, pid);
+   proc->tree_lft = lft;
+   proc->tree_rht = rht;
+   proc->tree_index = *node_index;
+   proc->tree_deep = level;
+}
+
+static void ProcessList_buildTree(ProcessList* this) {
+   int node_counter = 0;
+   int node_index = 0;
+   // Save settings
+   int direction = this->settings->direction;
+   int sortKey = this->settings->sortKey;
+   // Sort by PID
+   this->settings->sortKey = PID;
+   this->settings->direction = 1;
+   Vector_quickSort(this->processes);
+   // Restore settings
+   this->settings->sortKey = sortKey;
+   this->settings->direction = direction;
+   int vsize = Vector_size(this->processes);
+   // Find all processes whose parent is not visible
+   int size;
+   while ((size = Vector_size(this->processes))) {
+      int i;
+      for (i = 0; i < size; i++) {
+         Process* process = (Process*)(Vector_get(this->processes, i));
+         // Immediately consume not shown processes
+         if (!process->show) {
+            process = (Process*)(Vector_take(this->processes, i));
+            process->indent = 0;
+            Vector_add(this->processes2, process);
+            ProcessList_buildTreeBranch(this, process->pid, 0, 0, direction, false, &node_counter, &node_index);
+            break;
+         }
+         pid_t ppid = Process_getParentPid(process);
+         // Bisect the process vector to find parent
+         int l = 0, r = size;
+         // If PID corresponds with PPID (e.g. "kernel_task" (PID:0, PPID:0)
+         // on Mac OS X 10.11.6) cancel bisecting and regard this process as
+         // root.
+         if (process->pid == ppid)
+            r = 0;
+         while (l < r) {
+            int c = (l + r) / 2;
+            pid_t pid = ((Process*)(Vector_get(this->processes, c)))->pid;
+            if (ppid == pid) {
+               break;
+            } else if (ppid < pid) {
+               r = c;
+            } else {
+               l = c + 1;
+            }
+         }
+         // If parent not found, then construct the tree with this root
+         if (l >= r) {
+            process = (Process*)(Vector_take(this->processes, i));
+            process->indent = 0;
+            Vector_add(this->processes2, process);
+            ProcessList_buildTreeBranch(this, process->pid, 0, 0, direction, process->showChildren, &node_counter, &node_index);
+            break;
+         }
+      }
+      // There should be no loop in the process tree
+      assert(i < size);
+   }
+   assert(Vector_size(this->processes2) == vsize); (void)vsize;
+   assert(Vector_size(this->processes) == 0);
+   // Swap listings around
+   Vector* t = this->processes;
+   this->processes = this->processes2;
+   this->processes2 = t;
 }
 
 void ProcessList_sort(ProcessList* this) {
    if (!this->settings->treeView) {
       Vector_insertionSort(this->processes);
    } else {
-      // Save settings
-      int direction = this->settings->direction;
-      int sortKey = this->settings->sortKey;
-      // Sort by PID
-      this->settings->sortKey = PID;
-      this->settings->direction = 1;
-      Vector_quickSort(this->processes);
-      // Restore settings
-      this->settings->sortKey = sortKey;
-      this->settings->direction = direction;
-      int vsize = Vector_size(this->processes);
-      // Find all processes whose parent is not visible
-      int size;
-      while ((size = Vector_size(this->processes))) {
-         int i;
-         for (i = 0; i < size; i++) {
-            Process* process = (Process*)(Vector_get(this->processes, i));
-            // Immediately consume not shown processes
-            if (!process->show) {
-               process = (Process*)(Vector_take(this->processes, i));
-               process->indent = 0;
-               Vector_add(this->processes2, process);
-               ProcessList_buildTree(this, process->pid, 0, 0, direction, false);
-               break;
-            }
-            pid_t ppid = Process_getParentPid(process);
-            // Bisect the process vector to find parent
-            int l = 0, r = size;
-            // If PID corresponds with PPID (e.g. "kernel_task" (PID:0, PPID:0)
-            // on Mac OS X 10.11.6) cancel bisecting and regard this process as
-            // root.
-            if (process->pid == ppid)
-               r = 0;
-            while (l < r) {
-               int c = (l + r) / 2;
-               pid_t pid = ((Process*)(Vector_get(this->processes, c)))->pid;
-               if (ppid == pid) {
-                  break;
-               } else if (ppid < pid) {
-                  r = c;
-               } else {
-                  l = c + 1;
-               }
-            }
-            // If parent not found, then construct the tree with this root
-            if (l >= r) {
-               process = (Process*)(Vector_take(this->processes, i));
-               process->indent = 0;
-               Vector_add(this->processes2, process);
-               ProcessList_buildTree(this, process->pid, 0, 0, direction, process->showChildren);
-               break;
-            }
-         }
-         // There should be no loop in the process tree
-         assert(i < size);
-      }
-      assert(Vector_size(this->processes2) == vsize); (void)vsize;
-      assert(Vector_size(this->processes) == 0);
-      // Swap listings around
-      Vector* t = this->processes;
-      this->processes = this->processes2;
-      this->processes2 = t;
+      ProcessList_sortTreeSet(this);
    }
 }
 
@@ -311,4 +379,6 @@ void ProcessList_scan(ProcessList* this) {
       else
          p->updated = false;
    }
+
+   ProcessList_buildTree(this);
 }

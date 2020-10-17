@@ -51,6 +51,7 @@ typedef enum ProcessFields {
    TIME = 50,
    NLWP = 51,
    TGID = 52,
+   TREE_SET = 53,
 } ProcessField;
 
 typedef struct ProcessPidColumn_ {
@@ -103,6 +104,11 @@ typedef struct Process_ {
 
    unsigned long int minflt;
    unsigned long int majflt;
+
+   unsigned int tree_lft;
+   unsigned int tree_rht;
+   unsigned int tree_index;
+   unsigned int tree_deep;
 } Process;
 
 typedef struct ProcessFieldData_ {

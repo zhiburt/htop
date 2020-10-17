@@ -34,6 +34,9 @@ typedef struct ProcessList_ {
    Hashtable* processTable;
    UsersTable* usersTable;
 
+   Hashtable* treeSet;
+   Vector* treeSetVec;
+
    Panel* panel;
    int following;
    uid_t userId;
