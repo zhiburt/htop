@@ -478,7 +478,8 @@ long Process_compare(const void* v1, const void* v2) {
    case SESSION:
       return (p1->session - p2->session);
    case TREE_SET:
-      return (p1->indent < p2->indent && p1->tree_index < p2->tree_index) ? -1 : 1;
+      // return (p1->tree_lft < p2->tree_lft && p1->tree_rht > p2->tree_rht) ? -1 : 1;
+      return (p1->tree_lft < p2->tree_lft) ? -1 : 1;
    case STARTTIME: {
       if (p1->starttime_ctime == p2->starttime_ctime)
          return (p1->pid - p2->pid);

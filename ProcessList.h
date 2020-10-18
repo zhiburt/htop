@@ -35,7 +35,6 @@ typedef struct ProcessList_ {
    UsersTable* usersTable;
 
    Hashtable* treeSet;
-   Vector* treeSetVec;
 
    Panel* panel;
    int following;

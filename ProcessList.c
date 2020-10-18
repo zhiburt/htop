@@ -6,9 +6,11 @@ in the source distribution for its full text.
 */
 
 #include "ProcessList.h"
+#include "Hashtable.h"
 #include "Platform.h"
 
 #include "CRT.h"
+#include "Process.h"
 #include "StringUtils.h"
 #include "Vector.h"
 
@@ -25,8 +27,7 @@ ProcessList* ProcessList_init(ProcessList* this, const ObjectClass* klass, Users
 
    // tree-view auxiliary buffer
    this->processes2 = Vector_new(klass, true, DEFAULT_SIZE);
-
-   this->treeSet = Hashtable_new(1400, false);
+   this->treeSet = Hashtable_new(140, false);
 
    // set later by platform-specific code
    this->cpuCount = 0;
@@ -63,7 +64,7 @@ void ProcessList_done(ProcessList* this) {
    Hashtable_delete(this->processTable);
    Vector_delete(this->processes);
    Vector_delete(this->processes2);
-   Vector_delete(this->treeSetVec);
+   Hashtable_delete(this->treeSet);
 }
 
 void ProcessList_setPanel(ProcessList* this, Panel* panel) {
@@ -116,56 +117,70 @@ int ProcessList_size(ProcessList* this) {
    return (Vector_size(this->processes));
 }
 
-static int ProcessList_sortTreeSetLayer(ProcessList* this, pid_t pid, int deep) {
-   Vector* layer = Vector_new(Class(Process), false, DEFAULT_SIZE);
+static void HashTableView(int key, void* data, void* _) {
+   Process* proc = ((Process*)data);
+   int i = key;
+   printf("i=%d, pid=%d | lft=%d, rht=%d, deep=%d, indent=%d\n", i, proc->pid, proc->tree_lft, proc->tree_rht, proc->tree_deep, proc->indent);
+}
+
+static int ProcessList_updateTreeSetLayer(ProcessList* this, int deep, int lft, int rht, int* index, int* tree_index, int indent_) {
+   Vector* layer = Vector_new(this->processes->type, false, DEFAULT_SIZE);
 
    for (int i = 0; i < Vector_size(this->processes); i++) {
-      Process* process = (Process*) (Vector_get(this->processes, i));
-      // Process_isChildOf can be replaced by isInRange
-      if (process->tree_deep == deep && Process_isChildOf(process, pid)) {
-         process = (Process*) (Vector_take(this->processes, i));
-         Vector_add(layer, process);
+      Process* proc = (Process*)Vector_get(this->processes, i);
+      if (proc->tree_deep == deep && proc->tree_lft > lft && proc->tree_rht < rht) {
+         Vector_add(layer, proc);
       }
    }
 
    Vector_quickSort(layer);
 
    int size = Vector_size(layer);
-   // printf("deep=%d, size=%d\n", deep, size);
 
+   // printf("++++++++ %d %d\n", *tree_index, *index);
    for (int i = 0; i < Vector_size(layer); i++) {
-      Process* process = (Process*) (Vector_get(layer, i));
+      // printf("BUT NOT HERE\n");
+      int lft = (*tree_index)++;
+      int idx = (*index)++;
 
-      // todo: indent resolve
+      int level = deep-1;
+      int nextIndent_ = indent_ == -1 ? 0 : indent_ | (1 << level);
+      int nextIndent__ = indent_ == -1 ? 0 : (i < size - 1) ? nextIndent_ : indent_;
 
-      Vector_add(this->processes2, process);
+      Process* proc = (Process*) (Vector_get(layer, i));
+      size += ProcessList_updateTreeSetLayer(this, deep+1, proc->tree_lft, proc->tree_rht, index, tree_index, nextIndent__);
 
-      size += ProcessList_sortTreeSetLayer(this, process->pid, deep+1);
+      int rht = (*tree_index)++;
+
+      Hashtable_put(this->treeSet, idx, proc);
+      proc->tree_lft = lft;
+      proc->tree_rht = rht;
+
+      if (nextIndent_ == 0) {
+         proc->indent = 0;
+      } else if (i == size - 1)
+         proc->indent = -nextIndent_;
+      else
+         proc->indent = nextIndent_;
    }
-   
+
    Vector_delete(layer);
 
    return size;
 }
 
-static void ProcessList_sortTreeSet(ProcessList* this) {
+static void ProcessList_updateTreeSet(ProcessList* this) {
+   int index = 0;
+   int tree_index = 1; // lft starts from 1
    int vsize = Vector_size(this->processes);
-   assert(0 == Vector_size(this->processes2));
-   int size = ProcessList_sortTreeSetLayer(this, 0, 0);
-   assert(size == Vector_size(this->processes2));
+   int size = ProcessList_updateTreeSetLayer(this, 0, 0, vsize*2, &index, &tree_index, -1);
    assert(size == vsize);
-   assert(0 == Vector_size(this->processes));
-
-   Vector* t = this->processes;
-   this->processes = this->processes2;
-   this->processes2 = t;
 }
 
-static void HashTableView(int key, void* data, void* _) {
-   printf("%d - %d\n", key, ((Process*)data)->pid);
-}
+static void ProcessList_buildTreeBranch(ProcessList* this, Process* proc, int level, int indent, int direction, bool show, int* node_counter, int* node_index) {
+   Hashtable_put(this->treeSet, *node_index, proc);
+   (*node_index)++;
 
-static void ProcessList_buildTreeBranch(ProcessList* this, pid_t pid, int level, int indent, int direction, bool show, int* node_counter, int* node_index) {
    (*node_counter)++;
    int lft = *node_counter;
 
@@ -173,7 +188,7 @@ static void ProcessList_buildTreeBranch(ProcessList* this, pid_t pid, int level,
 
    for (int i = Vector_size(this->processes) - 1; i >= 0; i--) {
       Process* process = (Process*) (Vector_get(this->processes, i));
-      if (process->show && Process_isChildOf(process, pid)) {
+      if (process->show && Process_isChildOf(process, proc->pid)) {
          process = (Process*) (Vector_take(this->processes, i));
          Vector_add(children, process);
       }
@@ -184,30 +199,26 @@ static void ProcessList_buildTreeBranch(ProcessList* this, pid_t pid, int level,
       Process* process = (Process*) (Vector_get(children, i));
       if (!show)
          process->show = false;
-      int s = this->processes2->items;
       if (direction == 1)
          Vector_add(this->processes2, process);
       else
          Vector_insert(this->processes2, 0, process);
-      assert(this->processes2->items == s+1);
+
       int nextIndent = indent | (1 << level);
-      ProcessList_buildTreeBranch(this, process->pid, level+1, (i < size - 1) ? nextIndent : indent, direction, show ? process->showChildren : false, node_counter, node_index);      
+      ProcessList_buildTreeBranch(this, process, level+1, (i < size - 1) ? nextIndent : indent, direction, show ? process->showChildren : false, node_counter, node_index);      
       if (i == size - 1)
          process->indent = -nextIndent;
       else
          process->indent = nextIndent;
-
-      (*node_index)++;
    }
    Vector_delete(children);
 
    (*node_counter)++;
    int rht = *node_counter;
 
-   Process* proc = (Process*)Hashtable_get(this->processTable, pid);
    proc->tree_lft = lft;
    proc->tree_rht = rht;
-   proc->tree_index = *node_index;
+   proc->tree_index = lft;
    proc->tree_deep = level;
 }
 
@@ -236,7 +247,7 @@ static void ProcessList_buildTree(ProcessList* this) {
             process = (Process*)(Vector_take(this->processes, i));
             process->indent = 0;
             Vector_add(this->processes2, process);
-            ProcessList_buildTreeBranch(this, process->pid, 0, 0, direction, false, &node_counter, &node_index);
+            ProcessList_buildTreeBranch(this, process, 0, 0, direction, false, &node_counter, &node_index);
             break;
          }
          pid_t ppid = Process_getParentPid(process);
@@ -263,7 +274,7 @@ static void ProcessList_buildTree(ProcessList* this) {
             process = (Process*)(Vector_take(this->processes, i));
             process->indent = 0;
             Vector_add(this->processes2, process);
-            ProcessList_buildTreeBranch(this, process->pid, 0, 0, direction, process->showChildren, &node_counter, &node_index);
+            ProcessList_buildTreeBranch(this, process, 0, 0, direction, process->showChildren, &node_counter, &node_index);
             break;
          }
       }
@@ -282,7 +293,15 @@ void ProcessList_sort(ProcessList* this) {
    if (!this->settings->treeView) {
       Vector_insertionSort(this->processes);
    } else {
-      ProcessList_sortTreeSet(this);
+      ProcessList_updateTreeSet(this);
+
+      int direction = this->settings->direction;
+      int sortKey = this->settings->sortKey;
+      this->settings->direction = 1;
+      this->settings->sortKey = TREE_SET;
+      Vector_quickSort(this->processes);
+      this->settings->sortKey = sortKey;
+      this->settings->direction = direction;
    }
 }
 
@@ -357,7 +376,6 @@ Process* ProcessList_getProcess(ProcessList* this, pid_t pid, bool* preExisting,
 }
 
 void ProcessList_scan(ProcessList* this) {
-
    // mark all process as "dirty"
    for (int i = 0; i < Vector_size(this->processes); i++) {
       Process* p = (Process*) Vector_get(this->processes, i);
@@ -381,4 +399,28 @@ void ProcessList_scan(ProcessList* this) {
    }
 
    ProcessList_buildTree(this);
+
+   // printf("-----proc-----\n");
+   // for (int i = 0; i < Vector_size(this->processes); i++) {
+   //    Process* proc = (Process*)Vector_get(this->processes, i);
+   //    printf("i=%d, pid=%d | lft=%d, rht=%d, deep=%d, ident=%d\n", i, proc->pid, proc->tree_lft, proc->tree_rht, proc->tree_deep, proc->indent);
+   // }
+
+   // printf("-----tree-----\n");
+   // Hashtable_foreach(this->treeSet, HashTableView, NULL);
+
+   // this->settings->sortKey = PERCENT_CPU;
+
+   // this->settings->treeView = true;
+   // ProcessList_sort(this);
+   // printf("-----tree-----\n");
+   // Hashtable_foreach(this->treeSet, HashTableView, NULL);
+
+   // printf("-----proc-----\n");
+   // for (int i = 0; i < Vector_size(this->processes); i++) {
+   //    Process* proc = (Process*)Vector_get(this->processes, i);
+   //    printf("i=%d, pid=%d | lft=%d, rht=%d, deep=%d, ident=%d\n", i, proc->pid, proc->tree_lft, proc->tree_rht, proc->tree_deep, proc->indent);
+   // }
+
+   // exit(1);
 }
